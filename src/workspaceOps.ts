@@ -2,11 +2,12 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { PathGuard } from "./guard.js";
 import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
-import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
+import { gitBranch, gitDiff, gitDirtyState, gitLog, gitResolvedRevision, gitStatus } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
 
@@ -21,6 +22,11 @@ export interface WorkspaceSummary {
   skillCounts: Record<string, number>;
   tree?: string;
   gitStatus: string;
+  resolvedRevision?: string;
+  gitBranch?: string;
+  dirtyState: "clean" | "dirty" | "unknown";
+  workspaceFingerprint: string;
+  workspaceFingerprintBasis: string[];
 }
 
 export interface CodexContext {
@@ -44,6 +50,58 @@ async function safeReaddir(dir: string): Promise<fs.Dirent[]> {
   } catch {
     return [];
   }
+}
+
+const WORKSPACE_IDENTITY_FILES = [
+  "AGENTS.md",
+  "AGENTS.override.md",
+  ".agents.md",
+  "agents.md",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "uv.lock",
+  "poetry.lock",
+  "requirements.lock",
+  "Cargo.lock",
+  "go.sum"
+] as const;
+
+async function workspaceFingerprint(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  resolvedRevision: string | undefined
+): Promise<{ fingerprint: string; basis: string[] }> {
+  const hash = createHash("sha256");
+  const basis: string[] = [];
+
+  const add = (name: string, value: string): void => {
+    hash.update(name);
+    hash.update("\0");
+    hash.update(value);
+    hash.update("\0");
+    basis.push(name);
+  };
+
+  add("git_revision", resolvedRevision ?? "non-git");
+  add("bash_mode", config.bashMode);
+  add("write_mode", config.writeMode);
+  add("tool_mode", config.toolMode);
+
+  for (const rel of WORKSPACE_IDENTITY_FILES) {
+    try {
+      const resolved = guard.resolve(workspace, rel);
+      const stat = await fsp.lstat(resolved.absPath);
+      if (!stat.isFile()) continue;
+      const bytes = await fsp.readFile(resolved.absPath);
+      add(`file:${rel}`, createHash("sha256").update(bytes).digest("hex"));
+    } catch {
+      // Optional identity inputs are absent in many repositories.
+    }
+  }
+
+  return { fingerprint: hash.digest("hex"), basis };
 }
 
 export async function discoverSkills(workspace: Workspace, options: { includeGlobal?: boolean } = {}): Promise<string[]> {
@@ -177,11 +235,15 @@ export async function workspaceSummary(
   }
 
   const status = gitStatus(config, workspace);
+  const resolvedRevision = gitResolvedRevision(config, workspace);
+  const branch = gitBranch(config, workspace);
+  const dirtyState = gitDirtyState(config, workspace);
+  const identity = await workspaceFingerprint(config, guard, workspace, resolvedRevision);
   const log = gitLog(config, workspace, 5);
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nResolved revision: ${resolvedRevision ?? "n/a"}\nGit branch: ${branch ?? "n/a"}\nDirty state: ${dirtyState}\nWorkspace fingerprint: ${identity.fingerprint}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
@@ -193,7 +255,12 @@ export async function workspaceSummary(
     skillInventory,
     skillCounts: counts,
     tree: treeText,
-    gitStatus: status
+    gitStatus: status,
+    resolvedRevision,
+    gitBranch: branch,
+    dirtyState,
+    workspaceFingerprint: identity.fingerprint,
+    workspaceFingerprintBasis: identity.basis
   };
 }
 

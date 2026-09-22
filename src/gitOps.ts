@@ -80,6 +80,24 @@ export function gitLog(config: CodexProConfig, workspace: Workspace, maxCount = 
   return runGit(workspace, ["log", `--max-count=${count}`, "--oneline", "--decorate"], config.maxOutputBytes);
 }
 
+export function gitResolvedRevision(config: CodexProConfig, workspace: Workspace): string | undefined {
+  const output = runGit(workspace, ["rev-parse", "HEAD"], config.maxOutputBytes);
+  if (isGitFailure(output) || output === "(no output)") return undefined;
+  return output.trim();
+}
+
+export function gitBranch(config: CodexProConfig, workspace: Workspace): string | undefined {
+  const output = runGit(workspace, ["symbolic-ref", "--short", "-q", "HEAD"], config.maxOutputBytes);
+  if (isGitFailure(output) || output === "(no output)") return undefined;
+  return output.trim();
+}
+
+export function gitDirtyState(config: CodexProConfig, workspace: Workspace): "clean" | "dirty" | "unknown" {
+  const output = runGit(workspace, ["status", "--porcelain"], config.maxOutputBytes);
+  if (isGitFailure(output)) return "unknown";
+  return output === "(no output)" ? "clean" : "dirty";
+}
+
 export function assertGitCleanEnoughForWrite(_workspace: Workspace): void {
   // Reserved for future policy hooks. The first version allows writes and returns diffs.
   return;

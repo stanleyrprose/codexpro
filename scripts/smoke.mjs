@@ -486,6 +486,19 @@ const inventory = await client.request('tools/call', { name: 'codexpro_inventory
 if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') throw new Error('inventory result was not tagged for widget rendering');
 const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
 const ws = opened.structuredContent.workspace_id;
+const expectedWorkspaceRevision = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: tmp, encoding: 'utf8' }).stdout.trim();
+if (opened.structuredContent.resolved_revision !== expectedWorkspaceRevision) {
+  throw new Error(`open_workspace resolved revision mismatch: ${opened.structuredContent.resolved_revision} vs ${expectedWorkspaceRevision}`);
+}
+if (!['clean', 'dirty', 'unknown'].includes(opened.structuredContent.dirty_state)) {
+  throw new Error(`open_workspace returned invalid dirty_state: ${opened.structuredContent.dirty_state}`);
+}
+if (!/^[0-9a-f]{64}$/.test(opened.structuredContent.workspace_fingerprint ?? '')) {
+  throw new Error(`open_workspace returned invalid workspace fingerprint: ${opened.structuredContent.workspace_fingerprint}`);
+}
+if (!opened.structuredContent.workspace_fingerprint_basis?.includes?.('git_revision')) {
+  throw new Error(`workspace fingerprint basis omitted git revision: ${JSON.stringify(opened.structuredContent.workspace_fingerprint_basis)}`);
+}
 const viewedImage = await client.request('tools/call', { name: 'view_image', arguments: { workspace_id: ws, path: 'pixel.png' } });
 const imagePart = viewedImage.content?.find?.((part) => part.type === 'image');
 if (!imagePart?.data || imagePart.mimeType !== 'image/png' || viewedImage.structuredContent.width !== 1 || viewedImage.structuredContent.height !== 1) {
@@ -511,6 +524,9 @@ if (!structuredSearch.structuredContent.analysis?.groups?.definitions?.length ||
 const openedByPath = await client.request('tools/call', { name: 'open_workspace', arguments: { path: tmp, include_tree: false } });
 if (openedByPath.structuredContent.workspace_id !== ws) {
   throw new Error(`open_workspace path alias returned ${openedByPath.structuredContent.workspace_id}, expected ${ws}`);
+}
+if (openedByPath.structuredContent.workspace_fingerprint !== opened.structuredContent.workspace_fingerprint) {
+  throw new Error(`workspace fingerprint changed across equivalent opens: ${opened.structuredContent.workspace_fingerprint} -> ${openedByPath.structuredContent.workspace_fingerprint}`);
 }
 await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'demo.txt' } });
 await fs.writeFile(path.join(tmp, 'tokens.txt'), [
