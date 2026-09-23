@@ -8,6 +8,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolvedGitRevision, worktreeFingerprint, workspaceIdentityFingerprint } from '../dist/handoffBaseline.js';
 import {
   CLOUDFLARED_VERSION,
   cloudflaredReleaseAsset,
@@ -1888,6 +1889,12 @@ function loadHandoffExecution(args) {
     throw new Error(`No handoff plan found at ${path.relative(root, planPath)}. Ask ChatGPT to call handoff_to_agent first.`);
   }
   const planText = readTextFileBounded(planPath, maxReadBytes);
+  const baselinePath = resolveWorkspaceFile(root, path.join(contextDir, 'handoff-baseline.json'));
+  let baseline = null;
+  if (fs.existsSync(baselinePath)) {
+    const parsed = JSON.parse(readTextFileBounded(baselinePath, Math.min(maxReadBytes, 100_000)));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) baseline = parsed;
+  }
   const commandInfo = buildExecutorCommand(args, root, planPath, planText);
   const commandText = executorCommandPreview(commandInfo);
   return {
@@ -1896,6 +1903,8 @@ function loadHandoffExecution(args) {
     bridgeDir,
     planPath,
     planText,
+    baselinePath,
+    baseline,
     commandInfo,
     commandText,
     maxOutputBytes,
@@ -1914,7 +1923,69 @@ function printHandoffDryRun(request, title = 'CodexPro execute-handoff dry run')
   ]);
 }
 
+function observeHandoffBaseline(request) {
+  const expected = request.baseline;
+  if (!expected) return { valid: true, legacy: true, mismatches: [], observed: null };
+  const revision = resolvedGitRevision(request.root) ?? null;
+  const modes = expected.workspace_modes && typeof expected.workspace_modes === 'object' ? expected.workspace_modes : {};
+  const identity = workspaceIdentityFingerprint({
+    root: request.root,
+    revision: revision ?? undefined,
+    bashMode: String(modes.bash_mode ?? ''),
+    writeMode: String(modes.write_mode ?? ''),
+    toolMode: String(modes.tool_mode ?? '')
+  });
+  const worktree = worktreeFingerprint(request.root, request.contextDir) ?? null;
+  const observedPlanHash = planHash(request.planText);
+  const mismatches = [];
+  if (expected.plan_hash && expected.plan_hash !== observedPlanHash) mismatches.push('plan_hash');
+  if ('baseline_revision' in expected && expected.baseline_revision !== revision) mismatches.push('baseline_revision');
+  if (expected.workspace_fingerprint && expected.workspace_fingerprint !== identity.fingerprint) mismatches.push('workspace_fingerprint');
+  if ('worktree_fingerprint' in expected && expected.worktree_fingerprint !== worktree) mismatches.push('worktree_fingerprint');
+  return {
+    valid: mismatches.length === 0,
+    legacy: false,
+    mismatches,
+    observed: {
+      plan_hash: observedPlanHash,
+      baseline_revision: revision,
+      workspace_fingerprint: identity.fingerprint,
+      worktree_fingerprint: worktree
+    }
+  };
+}
+
+function recordStaleBaseline(request, observation, iteration = 1) {
+  const expected = request.baseline ?? {};
+  writeHandoffRunState(request.root, request.contextDir, {
+    state: 'stale_baseline',
+    iteration,
+    started_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+    plan_hash: observation.observed?.plan_hash ?? planHash(request.planText),
+    baseline_revision: expected.baseline_revision ?? null,
+    observed_revision: observation.observed?.baseline_revision ?? null,
+    workspace_fingerprint: expected.workspace_fingerprint ?? null,
+    observed_workspace_fingerprint: observation.observed?.workspace_fingerprint ?? null,
+    worktree_fingerprint: expected.worktree_fingerprint ?? null,
+    observed_worktree_fingerprint: observation.observed?.worktree_fingerprint ?? null,
+    baseline_mismatches: observation.mismatches,
+    exit_code: null,
+    timed_out: false,
+    reconcile_required: true,
+    execution_outcome: 'not_started'
+  });
+}
+
 async function executeHandoffRequest(request, args, options = {}) {
+  const iteration = Number.isFinite(options.iteration) ? options.iteration : 1;
+  if (!options.skipBaselineCheck) {
+    const baselineObservation = observeHandoffBaseline(request);
+    if (!baselineObservation.valid) {
+      recordStaleBaseline(request, baselineObservation, iteration);
+      throw new Error(`STALE_BASELINE: ${baselineObservation.mismatches.join(', ')} changed since handoff creation. Reconcile or rewrite the handoff plan before execution.`);
+    }
+  }
   const confirmed = options.skipConfirmation ? true : await confirmLocalExecution(args, request.root, request.commandInfo);
   if (!confirmed) {
     statusLine('warn', 'Execution cancelled.');
@@ -1925,7 +1996,6 @@ async function executeHandoffRequest(request, args, options = {}) {
     throw new Error(`${request.commandInfo.command} was not found. Install it, add it to PATH, pass an absolute path, or use --command.`);
   }
 
-  const iteration = Number.isFinite(options.iteration) ? options.iteration : 1;
   const runPlanHash = planHash(request.planText);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
@@ -1937,6 +2007,11 @@ async function executeHandoffRequest(request, args, options = {}) {
     iteration,
     started_at: startedAt,
     plan_hash: runPlanHash,
+    ...(request.baseline ? {
+      baseline_revision: request.baseline.baseline_revision ?? null,
+      workspace_fingerprint: request.baseline.workspace_fingerprint ?? null,
+      worktree_fingerprint: request.baseline.worktree_fingerprint ?? null
+    } : {}),
     executor: request.commandInfo.agent,
     model: request.commandInfo.model || undefined,
     pid: process.pid,
@@ -2753,7 +2828,7 @@ async function runLoopHandoff(argv) {
     });
 
     const beforeExecutionFingerprint = changeFingerprintExcludingContext(root, contextDir);
-    const execution = await executeHandoffRequest(request, { ...args, yes: true }, { skipConfirmation: true, iteration });
+    const execution = await executeHandoffRequest(request, { ...args, yes: true }, { skipConfirmation: true, skipBaselineCheck: iteration > 1, iteration });
     const diffText = readGitDiffExcludingContext(root, contextDir, maxOutputBytes);
     fs.writeFileSync(paths.diffPath, diffText || '', { mode: 0o600 });
     const currentChangeFingerprint = changeFingerprintExcludingContext(root, contextDir);

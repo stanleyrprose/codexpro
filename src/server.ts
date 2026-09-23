@@ -12,6 +12,7 @@ import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
+import { dirtyGitState, resolvedGitRevision, worktreeFingerprint, workspaceIdentityFingerprint } from "./handoffBaseline.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -846,6 +847,8 @@ async function writeAgentHandoff(
   diffPath: string;
   logPath: string;
   executionLogPath: string;
+  baselinePath: string;
+  baseline: Record<string, unknown>;
   prompt: string;
   writeResult: Awaited<ReturnType<typeof writeTextFile>>;
 }> {
@@ -861,6 +864,7 @@ async function writeAgentHandoff(
   const diffPath = `${config.contextDir}/implementation-diff.patch`;
   const logPath = `${config.contextDir}/session-log.jsonl`;
   const executionLogPath = `${config.contextDir}/execution-log.jsonl`;
+  const baselinePath = `${config.contextDir}/handoff-baseline.json`;
   const body = buildAgentPlanBody({
     title: options.title,
     plan,
@@ -879,6 +883,26 @@ async function writeAgentHandoff(
     content = `${raw.trimEnd()}\n\n---\n\n${body}`;
   }
 
+  const revision = resolvedGitRevision(workspace.root);
+  const identity = workspaceIdentityFingerprint({
+    root: workspace.root,
+    revision,
+    bashMode: config.bashMode,
+    writeMode: config.writeMode,
+    toolMode: config.toolMode
+  });
+  const baseline = {
+    version: 1,
+    created_at: new Date().toISOString(),
+    plan_hash: createHash("sha256").update(content).digest("hex"),
+    baseline_revision: revision ?? null,
+    dirty_state: dirtyGitState(workspace.root),
+    workspace_fingerprint: identity.fingerprint,
+    workspace_fingerprint_basis: identity.basis,
+    worktree_fingerprint: worktreeFingerprint(workspace.root, config.contextDir) ?? null,
+    workspace_modes: { bash_mode: config.bashMode, write_mode: config.writeMode, tool_mode: config.toolMode }
+  };
+  await writeTextFile(config, guard, workspace, baselinePath, `${JSON.stringify(baseline, null, 2)}\n`, { createDirs: true, overwrite: true });
   const writeResult = await writeTextFile(config, guard, workspace, planPath, content, { createDirs: true, overwrite: true });
   const event = {
     agent,
@@ -887,7 +911,11 @@ async function writeAgentHandoff(
     title: options.title,
     plan_path: planPath,
     status_path: statusPath,
-    diff_path: diffPath
+    diff_path: diffPath,
+    baseline_path: baselinePath,
+    baseline_revision: baseline.baseline_revision,
+    workspace_fingerprint: baseline.workspace_fingerprint,
+    worktree_fingerprint: baseline.worktree_fingerprint
   };
   const logResolved = guard.resolve(workspace, logPath, { forWrite: true });
   const executionLogResolved = guard.resolve(workspace, executionLogPath, { forWrite: true });
@@ -915,6 +943,8 @@ async function writeAgentHandoff(
     diffPath,
     logPath,
     executionLogPath,
+    baselinePath,
+    baseline,
     prompt,
     writeResult
   };
@@ -2360,7 +2390,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
 
       const stateRel = `${config.contextDir}/handoff-run-state.json`;
       const contextPrefix = `${config.contextDir.replace(/\/+$/, "")}/`;
-      const terminalStates = new Set(["completed", "failed", "timed_out", "interrupted", "orphaned"]);
+      const terminalStates = new Set(["completed", "failed", "timed_out", "interrupted", "orphaned", "stale_baseline"]);
       const processAlive = (pid: unknown): boolean | undefined => {
         if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
         try {
@@ -2452,6 +2482,13 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         ...(resolvedState && resolvedState !== state?.state ? { effective_run_state: resolvedState } : {}),
         ...(typeof state?.iteration === "number" ? { iteration: state.iteration } : {}),
         ...(state?.plan_hash ? { plan_hash: state.plan_hash } : {}),
+        ...(state?.baseline_revision !== undefined ? { baseline_revision: state.baseline_revision } : {}),
+        ...(state?.observed_revision !== undefined ? { observed_revision: state.observed_revision } : {}),
+        ...(state?.workspace_fingerprint ? { workspace_fingerprint: state.workspace_fingerprint } : {}),
+        ...(state?.observed_workspace_fingerprint ? { observed_workspace_fingerprint: state.observed_workspace_fingerprint } : {}),
+        ...(state?.worktree_fingerprint ? { worktree_fingerprint: state.worktree_fingerprint } : {}),
+        ...(state?.observed_worktree_fingerprint ? { observed_worktree_fingerprint: state.observed_worktree_fingerprint } : {}),
+        ...(Array.isArray(state?.baseline_mismatches) ? { baseline_mismatches: state.baseline_mismatches } : {}),
         ...(expectedPlanHash ? { expected_plan_hash: expectedPlanHash, plan_hash_mismatch: planHashMismatch } : {}),
         ...(state && "exit_code" in state ? { exit_code: state.exit_code } : {}),
         ...(state && "timed_out" in state ? { timed_out: state.timed_out } : {}),
@@ -2503,6 +2540,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         ? `No handoff run state found at ${stateRel}. Start a run with handoff_to_agent + local execute-handoff/watch-handoff, then call wait_for_handoff again.`
         : awaitedTerminal && resolvedState === "orphaned"
           ? `Handoff run state is stale: recorded executor PID ${state.pid ?? "unknown"} no longer exists. The execution outcome may be ambiguous; reconcile Git and target state before retry.`
+          : awaitedTerminal && resolvedState === "stale_baseline"
+            ? `Handoff baseline is stale (${Array.isArray(state.baseline_mismatches) ? state.baseline_mismatches.join(", ") : "baseline mismatch"}). Reconcile or rewrite the handoff plan before execution.`
           : awaitedTerminal && resolvedState === "interrupted"
             ? `Handoff run was interrupted by ${state.interrupted_signal ?? "a parent signal"}. Reconcile Git and target state before retrying any material side effect.`
             : awaitedTerminal
@@ -2784,6 +2823,8 @@ ${result.prompt}
         diff_path: result.diffPath,
         log_path: result.logPath,
         execution_log_path: result.executionLogPath,
+        baseline_path: result.baselinePath,
+        baseline: result.baseline,
         additions: result.writeResult.diff.additions,
         deletions: result.writeResult.diff.deletions,
         diff: result.writeResult.diff.diff
@@ -2842,6 +2883,8 @@ ${result.prompt}
         diff_path: result.diffPath,
         log_path: result.logPath,
         execution_log_path: result.executionLogPath,
+        baseline_path: result.baselinePath,
+        baseline: result.baseline,
         additions: result.writeResult.diff.additions,
         deletions: result.writeResult.diff.deletions,
         diff: result.writeResult.diff.diff

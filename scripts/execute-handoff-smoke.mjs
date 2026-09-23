@@ -2,6 +2,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { resolvedGitRevision, worktreeFingerprint, workspaceIdentityFingerprint } from '../dist/handoffBaseline.js';
 
 function run(args, options = {}) {
   const result = spawnSync(process.execPath, ['scripts/codexpro.mjs', ...args], {
@@ -197,6 +199,44 @@ if (runState.exit_code !== 0 || runState.timed_out !== false || runState.executo
 }
 if (!runState.plan_hash || !runState.started_at || !runState.finished_at || runState.status_file !== '.ai-bridge/agent-status.md') {
   throw new Error(`handoff-run-state missing lifecycle fields\n${runStateRaw}`);
+}
+
+const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stale-baseline-'));
+await fs.mkdir(path.join(staleRoot, '.ai-bridge'), { recursive: true });
+const stalePlan = '# Stale baseline plan\n\nMust not execute after drift.\n';
+await fs.writeFile(path.join(staleRoot, '.ai-bridge', 'current-plan.md'), stalePlan, 'utf8');
+await fs.writeFile(path.join(staleRoot, 'app.txt'), 'unchanged\n', 'utf8');
+await fs.writeFile(path.join(staleRoot, 'agent.mjs'), `import fs from 'node:fs'; fs.appendFileSync('app.txt', 'SHOULD_NOT_RUN\\n');\n`, 'utf8');
+requireSuccess(spawnSync('git', ['init'], { cwd: staleRoot, encoding: 'utf8' }), 'stale git init');
+requireSuccess(spawnSync('git', ['add', 'app.txt', 'agent.mjs'], { cwd: staleRoot, encoding: 'utf8' }), 'stale git add');
+requireSuccess(spawnSync('git', ['-c', 'user.email=codexpro@example.invalid', '-c', 'user.name=CodexPro Smoke', 'commit', '-m', 'init'], { cwd: staleRoot, encoding: 'utf8' }), 'stale git commit');
+const staleRevision = resolvedGitRevision(staleRoot);
+const staleIdentity = workspaceIdentityFingerprint({ root: staleRoot, revision: staleRevision, bashMode: 'safe', writeMode: 'handoff', toolMode: 'standard' });
+const staleWorktree = worktreeFingerprint(staleRoot, '.ai-bridge');
+await fs.writeFile(path.join(staleRoot, '.ai-bridge', 'handoff-baseline.json'), `${JSON.stringify({
+  version: 1,
+  created_at: new Date().toISOString(),
+  plan_hash: createHash('sha256').update(stalePlan).digest('hex'),
+  baseline_revision: staleRevision,
+  dirty_state: 'clean',
+  workspace_fingerprint: staleIdentity.fingerprint,
+  workspace_fingerprint_basis: staleIdentity.basis,
+  worktree_fingerprint: staleWorktree,
+  workspace_modes: { bash_mode: 'safe', write_mode: 'handoff', tool_mode: 'standard' }
+}, null, 2)}\n`, 'utf8');
+await fs.appendFile(path.join(staleRoot, 'app.txt'), 'external drift\n', 'utf8');
+const staleRun = run([
+  'execute-handoff', '--root', staleRoot, '--agent', 'custom',
+  '--command', `${quoteArg(process.execPath)} agent.mjs --task-file {{plan_file}}`, '--yes'
+]);
+if (staleRun.status === 0 || !staleRun.stderr.includes('STALE_BASELINE')) {
+  throw new Error(`stale baseline execution was not rejected\nstdout:\n${staleRun.stdout}\nstderr:\n${staleRun.stderr}`);
+}
+const staleApp = await fs.readFile(path.join(staleRoot, 'app.txt'), 'utf8');
+if (staleApp.includes('SHOULD_NOT_RUN')) throw new Error(`stale baseline launched the agent unexpectedly\n${staleApp}`);
+const staleState = JSON.parse(await fs.readFile(path.join(staleRoot, '.ai-bridge', 'handoff-run-state.json'), 'utf8'));
+if (staleState.state !== 'stale_baseline' || staleState.reconcile_required !== true || staleState.execution_outcome !== 'not_started' || !staleState.baseline_mismatches?.includes('worktree_fingerprint')) {
+  throw new Error(`stale baseline state was incomplete: ${JSON.stringify(staleState)}`);
 }
 
 const fakeCodexBin = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-fake-codex-bin-'));
