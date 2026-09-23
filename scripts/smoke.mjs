@@ -1027,6 +1027,14 @@ const agentHandoff = await client.request('tools/call', {
   }
 });
 if (agentHandoff.structuredContent.agent !== 'opencode') throw new Error('handoff_to_agent did not preserve target agent');
+if (agentHandoff.structuredContent.baseline_path !== '.ai-bridge/handoff-baseline.json') throw new Error(`handoff_to_agent omitted baseline path: ${JSON.stringify(agentHandoff.structuredContent)}`);
+const handoffBaseline = JSON.parse(await fs.readFile(path.join(tmp, '.ai-bridge', 'handoff-baseline.json'), 'utf8'));
+if (handoffBaseline.version !== 1 || !/^[0-9a-f]{64}$/.test(handoffBaseline.plan_hash ?? '') || !/^[0-9a-f]{64}$/.test(handoffBaseline.workspace_fingerprint ?? '') || !/^[0-9a-f]{64}$/.test(handoffBaseline.worktree_fingerprint ?? '')) {
+  throw new Error(`handoff baseline receipt missing identity fields: ${JSON.stringify(handoffBaseline)}`);
+}
+if (handoffBaseline.baseline_revision !== expectedWorkspaceRevision || handoffBaseline.workspace_modes?.tool_mode !== 'full') {
+  throw new Error(`handoff baseline receipt did not bind current workspace: ${JSON.stringify(handoffBaseline)}`);
+}
 const escapedHandoff = await client.request('tools/call', {
   name: 'handoff_to_agent',
   arguments: {
@@ -1048,7 +1056,7 @@ for (const bridgeFile of ['agent-status.md', 'implementation-diff.patch', 'execu
   await fs.stat(path.join(tmp, '.ai-bridge', bridgeFile));
 }
 const handoffContext = await client.request('tools/call', { name: 'read_handoff', arguments: { workspace_id: ws } });
-for (const expectedFile of ['.ai-bridge/agent-status.md', '.ai-bridge/implementation-diff.patch', '.ai-bridge/execution-log.jsonl']) {
+for (const expectedFile of ['.ai-bridge/agent-status.md', '.ai-bridge/implementation-diff.patch', '.ai-bridge/execution-log.jsonl', '.ai-bridge/handoff-baseline.json']) {
   if (!handoffContext.structuredContent.files.includes(expectedFile)) {
     throw new Error(`read_handoff did not include ${expectedFile}`);
   }

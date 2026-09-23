@@ -2,13 +2,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { PathGuard } from "./guard.js";
 import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
 import { gitBranch, gitDiff, gitDirtyState, gitLog, gitResolvedRevision, gitStatus } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
+import { workspaceIdentityFingerprint } from "./handoffBaseline.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
 
 export interface WorkspaceSummary {
@@ -50,58 +50,6 @@ async function safeReaddir(dir: string): Promise<fs.Dirent[]> {
   } catch {
     return [];
   }
-}
-
-const WORKSPACE_IDENTITY_FILES = [
-  "AGENTS.md",
-  "AGENTS.override.md",
-  ".agents.md",
-  "agents.md",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "uv.lock",
-  "poetry.lock",
-  "requirements.lock",
-  "Cargo.lock",
-  "go.sum"
-] as const;
-
-async function workspaceFingerprint(
-  config: CodexProConfig,
-  guard: PathGuard,
-  workspace: Workspace,
-  resolvedRevision: string | undefined
-): Promise<{ fingerprint: string; basis: string[] }> {
-  const hash = createHash("sha256");
-  const basis: string[] = [];
-
-  const add = (name: string, value: string): void => {
-    hash.update(name);
-    hash.update("\0");
-    hash.update(value);
-    hash.update("\0");
-    basis.push(name);
-  };
-
-  add("git_revision", resolvedRevision ?? "non-git");
-  add("bash_mode", config.bashMode);
-  add("write_mode", config.writeMode);
-  add("tool_mode", config.toolMode);
-
-  for (const rel of WORKSPACE_IDENTITY_FILES) {
-    try {
-      const resolved = guard.resolve(workspace, rel);
-      const stat = await fsp.lstat(resolved.absPath);
-      if (!stat.isFile()) continue;
-      const bytes = await fsp.readFile(resolved.absPath);
-      add(`file:${rel}`, createHash("sha256").update(bytes).digest("hex"));
-    } catch {
-      // Optional identity inputs are absent in many repositories.
-    }
-  }
-
-  return { fingerprint: hash.digest("hex"), basis };
 }
 
 export async function discoverSkills(workspace: Workspace, options: { includeGlobal?: boolean } = {}): Promise<string[]> {
@@ -238,7 +186,13 @@ export async function workspaceSummary(
   const resolvedRevision = gitResolvedRevision(config, workspace);
   const branch = gitBranch(config, workspace);
   const dirtyState = gitDirtyState(config, workspace);
-  const identity = await workspaceFingerprint(config, guard, workspace, resolvedRevision);
+  const identity = workspaceIdentityFingerprint({
+    root: workspace.root,
+    revision: resolvedRevision,
+    bashMode: config.bashMode,
+    writeMode: config.writeMode,
+    toolMode: config.toolMode
+  });
   const log = gitLog(config, workspace, 5);
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
@@ -283,6 +237,7 @@ export async function readAiBridgeContext(
   }
   const relFiles = [
     `${config.contextDir}/current-plan.md`,
+    `${config.contextDir}/handoff-baseline.json`,
     `${config.contextDir}/agent-status.md`,
     `${config.contextDir}/implementation-diff.patch`,
     `${config.contextDir}/codex-status.md`,
