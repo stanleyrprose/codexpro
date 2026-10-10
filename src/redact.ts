@@ -9,11 +9,23 @@ const SECRET_ASSIGNMENT_PATTERN = /\b[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECR
 const SECRET_FIELD_PATTERN = /(["']?[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}["']?\s*:\s*)(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi;
 const SECRET_PATTERNS = [OPENAI_SECRET_PATTERN, COMMON_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CODEXPRO_TOKEN_ASSIGNMENT_PATTERN, CODEXPRO_TOKEN_FIELD_PATTERN, SECRET_ASSIGNMENT_PATTERN, SECRET_FIELD_PATTERN];
 
+// The broad TOKEN assignment heuristic also matches SQL counter increments.
+// Exempt only the known reservation counter columns using their *own* values
+// followed by a parameterized/integer addition; never exempt string literals,
+// unrelated identifiers, URL tokens, or actual credentials.
+function isReservationCounterIncrement(match: string, source: string, offset: number): boolean {
+  // The generic regex can consume a trailing '+' as part of its "secret",
+  // so validate the *full* SQL assignment with its following parameter.
+  const sql = /^(input_tokens_reserved|output_tokens_reserved)\s*=\s*(input_tokens_reserved|output_tokens_reserved)\s*\+\s*(?:%s|\$[1-9][0-9]?|[0-9]{1,12})(?=[,;\s)]|$)/i.exec(source.slice(offset));
+  return Boolean(sql && sql[1]?.toLowerCase() === sql[2]?.toLowerCase() && sql[0].startsWith(match));
+}
+
 export function hasSecretValue(text: string): boolean {
   for (const pattern of SECRET_PATTERNS) {
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
+      if (pattern === SECRET_ASSIGNMENT_PATTERN && isReservationCounterIncrement(match[0], text, match.index)) continue;
       if (!isPlaceholderSecret(match[0])) return true;
     }
   }
@@ -25,7 +37,9 @@ export function redactSensitiveText(text: string): string {
     .replace(CODEXPRO_TOKEN_ASSIGNMENT_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
     .replace(CODEXPRO_TOKEN_FIELD_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
     .replace(CLI_TOKEN_PATTERN, (match, prefix) => isPlaceholderSecret(match) ? match : `${prefix}[REDACTED_SECRET]`)
-    .replace(SECRET_ASSIGNMENT_PATTERN, (match) => isPlaceholderSecret(match) ? match : redactSecretAssignment(match))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (match, offset: number, source: string) =>
+      (isPlaceholderSecret(match) || isReservationCounterIncrement(match, source, offset))
+        ? match : redactSecretAssignment(match))
     .replace(SECRET_FIELD_PATTERN, (match, prefix) => isPlaceholderSecret(match) ? match : `${prefix}[REDACTED_SECRET]`)
     .replace(BEARER_TOKEN_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
     .replace(QUERY_TOKEN_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
